@@ -1,0 +1,2 @@
+# ads.txt — configure dynamically via admin > SEO tab.
+# This static file is the fallback served when the API isn't running.

@@ -1,0 +1,964 @@
+HDPORNFORYOU — VPS Deployment Guide
+===================================
+
+Cloudflare (proxied A record), Caddy, GEO routing, PM2, and PostgreSQL
+----------------------------------------------------------------------
+
+Architecture:
+
+  Visitor -> Cloudflare edge -> Caddy :443 -> Node 127.0.0.1:3001
+          -> PostgreSQL
+
+This deployment uses a proxied (orange-cloud) A record. Do not install
+cloudflared and do not use a Cloudflare Tunnel.
+
+The current live origin is replaced by this VPS. Follow A.6 for the cutover.
+
+Do not expose port 3001 or PostgreSQL 5432 publicly.
+Do not run PM2 as root in production.
+Do not leave /setup unclaimed on a live domain.
+
+
+Contents
+--------
+Part 0 — Common setup
+  0.1  VPS sizing and first boot
+  0.2  Base packages
+  0.3  PostgreSQL user and database
+  0.4  Application user, install, build
+  0.5  Existing database migration
+  0.6  Environment
+  0.7  Start with PM2
+
+Part A — Proxied A record (orange cloud)
+  A.1  DNS
+  A.2  Firewall
+  A.3  Cloudflare SSL and TLS certificate
+  A.4  Caddyfile
+  A.5  Verify
+  A.6  Cutover from the old origin
+
+Shared after go-live
+  S.1  Admin and SEO
+  S.2  Ad GEO routing
+  S.3  Operations
+
+Troubleshooting
+What NOT to do
+
+
+Part 0 — Common setup
+=====================
+
+0.1 VPS sizing and first boot (QDE Platinum)
+--------------------------------------------
+
+4 vCPU / 8 GB RAM / 80 GB NVMe is comfortable for 4 PM2 workers plus
+PostgreSQL. 2 GB swap is enough; use 4 GB only on a 2 GB RAM VPS.
+
+Choose Ubuntu 24.04 LTS (Noble), not a newer interim release. In the QDE
+panel set the VPS name to hdpornforyou-prod and the hostname to
+server.hdpornforyou.com. Add your SSH public key before the first boot.
+
+VNC is not needed for normal setup. Use it only as a rescue console if SSH
+or networking breaks, then disable it again.
+
+First login as root:
+
+  hostnamectl set-hostname server.hdpornforyou.com
+  echo '127.0.1.1 server.hdpornforyou.com server' >> /etc/hosts
+  hostname -f
+  timedatectl set-timezone UTC
+
+  adduser --disabled-password --gecos "" deploy
+  usermod -aG sudo deploy
+  install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+  cp /root/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
+  chown deploy:deploy /home/deploy/.ssh/authorized_keys
+  chmod 600 /home/deploy/.ssh/authorized_keys
+  echo 'deploy ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/90-deploy
+  sudo chmod 440 /etc/sudoers.d/90-deploy
+  sudo visudo -cf /etc/sudoers.d/90-deploy
+
+If you logged in with a password, add your public key to
+/root/.ssh/authorized_keys before running the copy. Test `ssh deploy@VPS-IP`
+in a second terminal before disabling root login. Then harden SSH:
+
+  sudo tee /etc/ssh/sshd_config.d/00-hdpf.conf >/dev/null <<'EOF'
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+EOF
+  sudo sshd -t && sudo systemctl reload ssh
+  sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|kbdinteractiveauthentication)'
+
+Add 2 GB swap before building:
+
+  sudo fallocate -l 2G /swapfile
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+  echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swap.conf
+  sudo sysctl --system
+  swapon --show
+  free -h
+
+
+0.2 Base packages
+-----------------
+
+Ubuntu 24.04 / Debian 12. Run as a sudo-capable user.
+
+  sudo apt update
+  sudo apt install -y curl ca-certificates gnupg lsb-release git rsync ufw
+
+Node.js 22 or 24 LTS (do not use a non-LTS "Current" release):
+
+  curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+  sudo apt install -y nodejs
+  node -v
+
+PM2:
+
+  sudo npm install -g pm2
+  pm2 -v
+
+PostgreSQL. Choose ONE of the two options below. Do not install both.
+
+Option 1 — Ubuntu 24.04 default (PostgreSQL 16, supported for a fresh site):
+
+  sudo apt install -y postgresql postgresql-contrib
+  sudo systemctl enable --now postgresql
+
+Option 2 — PostgreSQL 18 from PGDG (use this when restoring a dump from
+PostgreSQL 17 or 18; the current production dump is 17.6 and restores
+cleanly into 18):
+
+  sudo install -d /usr/share/postgresql-common/pgdg
+  sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    https://www.postgresql.org/media/keys/ACCC4CF8.asc
+  echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+  sudo apt update
+  sudo apt install -y postgresql-18 postgresql-contrib-18
+  sudo systemctl enable --now postgresql
+  sudo pg_lsclusters        # the 18 cluster must be on port 5432
+
+Caddy 2.8+ is required (for trusted_proxies / client_ip_headers). Install
+from the official repository, not the older Ubuntu package:
+
+  sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+    | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+    | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+  sudo chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  sudo chmod o+r /etc/apt/sources.list.d/caddy-stable.list
+  sudo apt update
+  sudo apt install -y caddy
+  caddy version        # must be 2.8 or newer
+
+Create the Caddy log directory once:
+
+  sudo mkdir -p /var/log/caddy
+  sudo chown caddy:caddy /var/log/caddy
+
+Do not install cloudflared. This deployment uses a proxied A record, not a
+Cloudflare Tunnel.
+
+
+0.3 PostgreSQL user and database
+--------------------------------
+
+Choose a strong alphanumeric password. Prefer an alphanumeric password (or
+quote the value in .env) so #, spaces or quotes do not break dotenv parsing.
+
+  DB_PASS="$(openssl rand -hex 24)"
+  echo "DB_PASS=$DB_PASS"
+
+  sudo -u postgres psql -c "CREATE USER hdpornforyou WITH PASSWORD '$DB_PASS';"
+  sudo -u postgres psql -c "CREATE DATABASE hdpornforyou OWNER hdpornforyou;"
+
+Keep PostgreSQL on 127.0.0.1:5432. On a fresh site the schema is applied
+automatically on the first application boot; do not import it manually.
+
+If you are migrating, restore the old dump before the first app boot
+(section 0.5). Do not let the app create a half-populated database first.
+
+
+0.4 Application user, install, build
+------------------------------------
+
+Run the app as a dedicated user, not root:
+
+  sudo adduser --disabled-password --gecos "" hdpornforyou
+  sudo mkdir -p /opt/hdpornforyou
+  sudo chown -R hdpornforyou:hdpornforyou /opt/hdpornforyou
+
+Put the application in /opt/hdpornforyou using ONE of these methods.
+
+A. Git checkout:
+
+  sudo -u hdpornforyou git clone <YOUR-REPO-URL> /opt/hdpornforyou
+
+B. Copy from an existing installation (use this when there is no git
+   remote; the current production directory is not a git repository):
+
+  # On the existing host, from the project directory:
+  rsync -avz --progress \
+    --exclude node_modules --exclude server/node_modules \
+    --exclude .env --exclude server/.env \
+    --exclude dist --exclude '*.zip' --exclude backups \
+    ./ deploy@VPS-IP:/tmp/hdpornforyou-src/
+
+  # On the new VPS:
+  sudo mkdir -p /opt/hdpornforyou
+  sudo rsync -a /tmp/hdpornforyou-src/ /opt/hdpornforyou/
+  sudo chown -R hdpornforyou:hdpornforyou /opt/hdpornforyou
+
+Option B includes server/uploads/. Never copy server/.env from the old
+host; create a new one in section 0.6.
+
+The rsync and scp commands assume the existing host can SSH to
+deploy@VPS-IP. If it cannot, create a tarball and copy it through your
+workstation instead.
+
+Install and build:
+
+  sudo -u hdpornforyou -H bash -lc '
+    cd /opt/hdpornforyou &&
+    npm ci --include=dev &&
+    npm run build
+  '
+
+`npm ci --include=dev` makes sure Vite/TypeScript are present even if
+NODE_ENV=production is set in the shell. It also installs the server
+production dependencies through the root postinstall script. `npm run build`
+writes the SPA to /opt/hdpornforyou/dist.
+
+
+0.5 Existing database migration (migration only)
+------------------------------------------------
+
+Skip this on a fresh site. Restore the old database before the first app
+boot, because the schema is applied automatically on boot.
+
+If the source runs PostgreSQL 17 or 18, install PostgreSQL 18 on the new VPS
+using Option 2 in section 0.2. A 17.6 dump restores into 18.6. Do not restore
+a dump from a newer major into an older server.
+
+On the old host:
+
+  pg_dump -Fc -h 127.0.0.1 -U hdpornforyou hdpornforyou \
+    > /tmp/hdpornforyou.dump
+  scp /tmp/hdpornforyou.dump deploy@VPS-IP:/tmp/
+
+On the new host (role and database already created in section 0.3):
+
+  sudo -u postgres pg_restore --no-owner --role=hdpornforyou \
+    -d hdpornforyou < /tmp/hdpornforyou.dump
+  sudo -u postgres psql -d hdpornforyou -c \
+    "SELECT count(*) AS videos FROM videos;"
+
+If pg_restore reports errors, stop and fix them before starting PM2. Do not
+let the app create a half-populated database and continue.
+
+
+0.6 Environment
+---------------
+
+  sudo -u hdpornforyou cp /opt/hdpornforyou/server/.env.example \
+    /opt/hdpornforyou/server/.env
+  sudo chmod 600 /opt/hdpornforyou/server/.env
+  sudo -u hdpornforyou nano /opt/hdpornforyou/server/.env
+
+Generate the session secret with `openssl rand -hex 32` and paste the output.
+Minimum production values:
+
+  PORT=3001
+  STATIC_DIR=../dist
+  SESSION_SECRET=<paste the openssl output here>
+  PGHOST=127.0.0.1
+  PGPORT=5432
+  PGUSER=hdpornforyou
+  PGPASSWORD=<same password as step 0.3>
+  PGDATABASE=hdpornforyou
+  PG_POOL_MAX=5
+  PG_POOL_MIN=1
+  COOKIE_SECURE=1
+  SEO_CANONICAL_BASE=https://YOUR-DOMAIN.com
+  ALLOWED_ORIGINS=https://YOUR-DOMAIN.com,https://www.YOUR-DOMAIN.com
+  ADMIN_USERNAME=admin
+  ADMIN_PASSWORD=<strong password>
+
+Notes:
+
+- SESSION_SECRET must stay stable. Changing it logs out every session.
+- ADMIN_USERNAME / ADMIN_PASSWORD seed the first admin only when no admin
+  exists. Set them before the first boot.
+- If you leave them empty, the first visitor to /setup can claim admin.
+  Open /setup immediately after deployment, or keep the site behind
+  Cloudflare Access until you have claimed it.
+- COOKIE_SECURE=1 requires HTTPS in the visitor's browser. Cloudflare
+  provides that.
+- Caddy terminates TLS and sets X-Forwarded-Proto: https. Do not add
+  header_up X-Forwarded-Proto in the Caddyfile.
+- Keep .env owned by the app user and mode 600.
+
+
+0.7 Start with PM2
+------------------
+
+Run PM2 as the application user, from the repo root:
+
+  sudo -u hdpornforyou -H bash -lc '
+    cd /opt/hdpornforyou &&
+    CLUSTER_WORKERS=4 PG_POOL_MAX=5 PG_POOL_MIN=1 \
+      pm2 start ecosystem.config.cjs
+  '
+
+Set CLUSTER_WORKERS to the number of vCPUs (4 is a safe default). Total
+database connections are approximately CLUSTER_WORKERS * PG_POOL_MAX; keep
+that below PostgreSQL max_connections (default 100).
+
+Save and enable boot start:
+
+  sudo -u hdpornforyou -H pm2 save
+  sudo env PATH="$PATH:/usr/bin" \
+    /usr/lib/node_modules/pm2/bin/pm2 startup systemd \
+    -u hdpornforyou --hp /home/hdpornforyou
+  sudo -u hdpornforyou -H pm2 save
+  systemctl is-enabled pm2-hdpornforyou
+
+If `pm2 startup` prints a command with an empty `-u`, use the explicit
+command above instead of copy-pasting its output.
+
+The ecosystem starts two apps:
+
+  hdpornforyou             cluster, CLUSTER_WORKERS replicas (API + SPA)
+  hdpornforyou-automation  fork, exactly 1 instance (import engine)
+
+Never scale hdpornforyou-automation above 1.
+Do not use `pm2 start npm -- run start -i 4`; PM2 needs the real JS entrypoint
+from ecosystem.config.cjs.
+
+PM2 rate limits are in-memory and therefore per worker. With 4 workers, the
+effective limit is roughly 4x the configured value.
+
+Check status and logs:
+
+  sudo -u hdpornforyou -H pm2 status
+  sudo -u hdpornforyou -H pm2 logs hdpornforyou --lines 100
+  sudo -u hdpornforyou -H pm2 logs hdpornforyou-automation --lines 100
+
+
+Part A — Proxied A record (orange cloud)
+========================================
+
+A.1 DNS
+-------
+
+In Cloudflare DNS:
+
+  Type A      Name @     IPv4 YOUR-VPS-IP       Proxied (orange cloud)
+  Type CNAME  Name www   Target YOUR-DOMAIN.com  Proxied (orange cloud)
+
+This deployment has no tunnel process: Caddy, PostgreSQL and PM2 (via
+`pm2 startup` + `pm2 save`) are the only services that need to come back,
+and all three are enabled at boot.
+
+If you are replacing the current origin, do NOT change the apex record yet.
+Prepare the new VPS, test it on a staging hostname, then follow A.6.
+
+Keep the record orange-cloud. A grey-cloud record exposes the VPS IP and
+bypasses Cloudflare, so /api/geo loses CF-IPCountry and ad routing falls
+back to the default.
+
+
+A.2 Firewall
+------------
+
+Allow SSH first, then open 80 and 443 to Cloudflare only. UFW example:
+
+  sudo ufw default deny incoming
+  sudo ufw default allow outgoing
+  sudo ufw allow 22/tcp
+  for ip in $(curl -s https://www.cloudflare.com/ips-v4) \
+            $(curl -s https://www.cloudflare.com/ips-v6); do
+      sudo ufw allow from "$ip" to any port 80 proto tcp
+      sudo ufw allow from "$ip" to any port 443 proto tcp
+  done
+  sudo ufw --force enable
+  sudo ufw status numbered
+
+If your provider has its own firewall, apply the same rules there as well.
+Do not open 80/443 to 0.0.0.0/0: anyone who learns the VPS IP can then
+bypass Cloudflare, and their requests arrive without CF-IPCountry, so
+/api/geo returns null and the ad router falls back to the default.
+
+Caddy's HTTP-01 challenge still works with this firewall because Let's
+Encrypt resolves YOUR-DOMAIN.com to Cloudflare, and Cloudflare forwards
+/.well-known/acme-challenge/ to the origin. Two Cloudflare settings can
+break it: a Redirect Rule that forces HTTPS on that path, and a WAF rule
+that blocks it. Cloudflare's "Always Use HTTPS" setting already exempts the
+ACME path, so that one is safe.
+
+Docker caveat: if you install Docker later, published container ports bypass
+UFW. Keep 3001 and 5432 bound to 127.0.0.1 and never publish them.
+
+
+A.3 Cloudflare SSL and TLS certificate
+--------------------------------------
+
+SSL/TLS -> Overview -> Full (strict).
+
+Caddy needs a certificate that Cloudflare Full (strict) trusts. Pick ONE.
+
+Option 1 (used in this deployment) — Let's Encrypt via Caddy
+
+  Leave the `tls` lines commented in A.4. Caddy obtains and renews a public
+  certificate automatically. HTTP-01 validation goes through Cloudflare, so
+  port 80 must be open to the Cloudflare edge ranges (A.2). If issuance
+  fails, confirm that no Redirect Rule or WAF rule blocks
+  /.well-known/acme-challenge/. As a last resort, temporarily allow 80/tcp
+  from anywhere, set the record to DNS-only (grey cloud) for the first
+  issuance, then restore the proxied record and the Cloudflare-only firewall.
+
+  Confirm issuance on the VPS:
+
+    sudo journalctl -u caddy | grep 'certificate obtained successfully'
+    sudo ls /var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory
+
+  Caddy renews in the background. No cron job is required.
+
+Option 2 — Cloudflare Origin Certificate
+
+  Cloudflare -> SSL/TLS -> Origin Server -> Create Certificate
+  Hostnames: YOUR-DOMAIN.com and *.YOUR-DOMAIN.com
+  Validity:   15 years
+
+  Save the files on the VPS, readable only by caddy:
+    /etc/caddy/origin.pem
+    /etc/caddy/origin-key.pem
+  sudo chown caddy:caddy /etc/caddy/origin.pem /etc/caddy/origin-key.pem
+  sudo chmod 600 /etc/caddy/origin.pem /etc/caddy/origin-key.pem
+
+  Then uncomment the `tls` line in BOTH site blocks in A.4. Caddy stops
+  using ACME for these names, so there is nothing to renew. Cloudflare
+  Full (strict) trusts this certificate. The wildcard
+  *.YOUR-DOMAIN.com also covers a staging hostname.
+
+Never use SSL mode "Flexible": Cloudflare would talk to Caddy over HTTP while
+Caddy redirects to HTTPS, producing an infinite redirect loop.
+
+
+A.4 Caddyfile
+-------------
+
+  {
+      servers {
+          # Replace with the full current list from cloudflare.com/ips
+          trusted_proxies static 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+          client_ip_headers CF-Connecting-IP X-Forwarded-For
+          trusted_proxies_strict
+      }
+  }
+
+  YOUR-DOMAIN.com {
+      encode zstd gzip
+
+      reverse_proxy 127.0.0.1:3001
+
+      # Uncomment only if you are using a Cloudflare Origin Certificate:
+      # tls /etc/caddy/origin.pem /etc/caddy/origin-key.pem
+
+      log {
+          output file /var/log/caddy/hdpornforyou-access.log
+          format json
+      }
+  }
+
+  www.YOUR-DOMAIN.com {
+      # If using a Cloudflare Origin Certificate, uncomment:
+      # tls /etc/caddy/origin.pem /etc/caddy/origin-key.pem
+      redir https://YOUR-DOMAIN.com{uri} permanent
+  }
+
+Caddy sets X-Forwarded-Proto: https itself because it terminates TLS, with
+either certificate option. Do not add header_up X-Forwarded-Proto.
+
+Reload:
+
+  sudo caddy validate --config /etc/caddy/Caddyfile
+  sudo systemctl reload caddy
+
+Refresh the Cloudflare CIDR list occasionally; Cloudflare publishes changes
+at https://www.cloudflare.com/ips/.
+
+Do not use `127.0.0.1/32 ::1/128` in the trusted_proxies block. This
+deployment must trust the Cloudflare edge ranges.
+
+
+A.5 Verify
+----------
+
+  curl -sSI https://YOUR-DOMAIN.com | grep -iE '^(HTTP|server|cf-ray)'
+  curl -sS  https://YOUR-DOMAIN.com/api/geo
+  curl -sS  https://YOUR-DOMAIN.com/api/health
+  curl -sS  https://YOUR-DOMAIN.com/robots.txt
+  curl -sS  https://YOUR-DOMAIN.com/sitemap.xml | head
+
+Expected:
+
+  server: cloudflare
+  cf-ray: ...
+  {"country":"XX"}          <- the visitor's real country
+  {"ok":true,...}
+
+Check that Caddy sees the real visitor IP (not a Cloudflare edge IP):
+
+  sudo tail -n 1 /var/log/caddy/hdpornforyou-access.log \
+    | python3 -c "import sys,json; d=json.load(sys.stdin); r=d['request']; print(r.get('client_ip'), r.get('remote_ip'))"
+
+client_ip must be the visitor's address. remote_ip should be a Cloudflare
+edge address. If client_ip is a Cloudflare edge IP, the trusted_proxies /
+client_ip_headers block is missing or wrong.
+
+Verify admin login through the public domain:
+
+  curl -sS -D - -o /dev/null -X POST https://YOUR-DOMAIN.com/api/auth/login \
+    -H 'Content-Type: application/json' \
+    -d '{"username":"admin","password":"YOUR-PASSWORD"}' \
+    | grep -i '^set-cookie'
+
+The cookie must include Secure and HttpOnly. If it does not, fix
+COOKIE_SECURE / TLS before going further. The command puts the password in
+your shell history; clear it afterward (`history -d <n>`).
+
+If /api/geo returns {"country":null}:
+
+- Confirm the request uses the domain, not the VPS IP.
+- Confirm the DNS record is orange-cloud proxied.
+- Confirm no proxy in front of Caddy strips CF-IPCountry.
+- Confirm the trusted_proxies block is present.
+
+Security checks:
+
+- A client-supplied CF-Connecting-IP sent through the domain should be
+  rejected by Cloudflare with 403 (error 1000).
+- A client-supplied X-Forwarded-For is appended to by Cloudflare, not
+  trusted as the client address.
+
+
+A.6 Cutover from the old origin
+------------------------------
+
+Do not repoint the apex record until the new stack has been tested through
+Cloudflare. Use a temporary proxied record first:
+
+  Type A   Name staging   IPv4 YOUR-VPS-IP   Proxied
+
+Add a staging block to Caddy with the same reverse_proxy. If you use a
+Cloudflare Origin Certificate, the wildcard *.YOUR-DOMAIN.com covers it;
+otherwise omit the `tls` line and Caddy obtains a Let's Encrypt certificate
+for the staging hostname. Add `header X-Robots-Tag "noindex"` to the staging
+block. Test health, /api/geo, admin login and ads on
+https://staging.YOUR-DOMAIN.com before touching the apex.
+
+Example staging block (Origin Certificate):
+
+  staging.YOUR-DOMAIN.com {
+      header X-Robots-Tag "noindex"
+      reverse_proxy 127.0.0.1:3001
+      tls /etc/caddy/origin.pem /etc/caddy/origin-key.pem
+      log {
+          output file /var/log/caddy/hdpornforyou-access.log
+          format json
+      }
+  }
+
+Final cutover:
+
+1. Stop writes on the old host (run as the user that owns PM2 there; the
+   current Kali host runs PM2 as root):
+     sudo -u <pm2-user> -H pm2 stop hdpornforyou hdpornforyou-automation
+
+2. Take the final database dump:
+     pg_dump -Fc -h 127.0.0.1 -U hdpornforyou hdpornforyou \
+       > /tmp/hdpornforyou.dump
+     scp /tmp/hdpornforyou.dump deploy@VPS-IP:/tmp/
+
+3. Sync the final uploads:
+     rsync -avz server/uploads/ deploy@VPS-IP:/tmp/hdpornforyou-uploads/
+
+   On the new host:
+     sudo rsync -a /tmp/hdpornforyou-uploads/ /opt/hdpornforyou/server/uploads/
+     sudo chown -R hdpornforyou:hdpornforyou /opt/hdpornforyou/server/uploads
+
+4. On the new host, stop PM2, replace the database with the final dump,
+   then start PM2:
+     sudo -u hdpornforyou -H pm2 stop hdpornforyou hdpornforyou-automation
+     sudo -u postgres dropdb --if-exists hdpornforyou
+     sudo -u postgres createdb -O hdpornforyou hdpornforyou
+     sudo -u postgres pg_restore --no-owner --role=hdpornforyou \
+       -d hdpornforyou < /tmp/hdpornforyou.dump
+     sudo -u hdpornforyou -H bash -lc '
+       cd /opt/hdpornforyou &&
+       CLUSTER_WORKERS=4 PG_POOL_MAX=5 PG_POOL_MIN=1 \
+         pm2 start ecosystem.config.cjs
+     '
+
+   If you tested the new VPS on staging, its database may already contain
+   schema/data. The drop/recreate above is required so the final cutover uses
+   the exact old data.
+
+5. In Cloudflare DNS delete the existing @ and www records, then create:
+     A      @    YOUR-VPS-IP      Proxied (orange cloud)
+     CNAME  www  YOUR-DOMAIN.com  Proxied (orange cloud)
+
+6. Verify the domain, /api/geo, admin login and ads. Keep the old server
+   for 24-48 hours for rollback; do not delete it the same day.
+
+7. Remove the staging DNS record when finished.
+
+If the cutover fails, restore the old DNS records and restart the old PM2
+processes. Do not run both origins behind the same hostname.
+
+
+Shared after go-live
+====================
+
+S.1 Admin and SEO
+-----------------
+
+If ADMIN_USERNAME / ADMIN_PASSWORD are set in server/.env, the first boot
+seeds the admin. The admin URL is the `adminPrefix` setting, not necessarily
+/admin. The default is /admin; open:
+
+  https://YOUR-DOMAIN.com/<admin-prefix>
+
+If you do not know the prefix, read it on the VPS:
+
+  sudo -u postgres psql -d hdpornforyou -Atc \
+    "SELECT value FROM settings WHERE key='auto_import';" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("adminPrefix"))'
+
+The SPA returns HTTP 404 for the admin URL on purpose, so crawlers and link
+unfurlers cannot discover the panel. A browser still renders the admin UI.
+
+If ADMIN_USERNAME / ADMIN_PASSWORD are not set, open
+https://YOUR-DOMAIN.com/setup immediately and create the admin.
+/api/setup/initialize is open to anyone until the first admin exists.
+
+If you restored an existing database, the admin already exists and the seed
+values are ignored.
+
+Then in Admin -> SEO:
+
+1. Set the canonical base to https://YOUR-DOMAIN.com (apex, no trailing slash).
+2. Set the site title, description and Open Graph image.
+3. Save.
+
+The Caddyfile redirects www to the apex. The canonical base keeps SSR heads,
+sitemap URLs and robots.txt on one host. On a fresh database there is no
+saved SEO row, so without this step the server falls back to the request host
+and can emit both apex and www canonicals.
+
+
+S.2 Ad GEO routing
+------------------
+
+In Admin -> Ads -> Networks & Routing:
+
+1. Enable the TrafficStars network.
+2. Enable the router.
+3. Enable GEO routing.
+4. Enable sending Tier-1 traffic to TrafficStars.
+5. Keep Force ExoClick and Force TrafficStars disabled for normal routing.
+6. Configure both provider IDs or scripts for the exact placement and device
+   in the related ad-format tab.
+
+Expected routing:
+
+  Tier-1 country      -> TrafficStars preferred
+  Tier-2/3 country    -> ExoClick preferred
+  Missing preferred   -> the other configured provider, unless routing is forced
+
+For NP (Tier-2/3), ExoClick is primary. TrafficStars is only a passback
+after a true 5-second no-fill or ExoClick script failure. This waterfall is
+intentional; do not force TrafficStars for NP.
+
+Test providers individually by temporarily enabling Force ExoClick or Force
+TrafficStars, then reload the public domain. Never leave both force controls
+enabled.
+
+ExoClick placement classes must match the format:
+
+  e20  native
+  e31  video slider
+  e37  outstream
+  e17  sticky banner
+  e2   banner
+  e10  mobile banner
+
+A native zone inside a 50px overflow:hidden sticky container will be
+clipped. A native zone used as a watch-page banner will render the wrong
+creative. Fix the zone format in the ExoClick dashboard, not in the rescue
+hook.
+
+Current zones to verify:
+
+  4204610  should be Sticky Banner, not native
+  5533244  should be Banner/Mobile Banner, not native
+  1234567  should be a real interstitial, or be disabled
+
+All tag placements currently use class `eas6a97888e10` (Mobile Banner/type
+10). That is only correct for mobile banner placements.
+
+Duplicate-zone guard:
+
+  The client renders at most one slot per network + zone ID on a page.
+  Reusing one ExoClick zone for the top banner and an in-feed banner (or for
+  the watch-player native and the related-feed native) shows only the first
+  slot; later duplicates hide instead of requesting and painting the same
+  creative again. This is enforced by src/lib/ad-zone-registry.ts and
+  applies to banner, native, sidebar, sticky, video slider, outstream and
+  interstitial slots.
+
+  To show more than one ad of the same format on one page, create separate
+  zones in ExoClick and assign them to the distinct placements (for example
+  watchAbove vs relatedFeedBanner). Do not reuse one zone for both.
+
+Cross-network rescue:
+
+  Every display format uses useAdRescue. If the primary zone paints no
+  creative within 5 seconds, ExoClick's render container is removed before
+  the TrafficStars passback is mounted, so the two networks cannot paint the
+  same slot.
+
+Per-placement frequency caps:
+
+  Admin -> Ads & VAST -> each format tab -> Placement zones now has a
+  "Frequency cap per session (0 = format cap)" field on every placement.
+  The value is written to both the desktop and mobile config for that
+  placement, so one number covers both devices.
+
+  0 means "use the format-level cap" (Banner, Native, Outstream, Interstitial,
+  In-video slider, Sticky). A non-zero value overrides the format cap for
+  that placement only. Counters are per placement, so homeFeedBanner and
+  searchFeedBanner each get their own allowance.
+
+  This applies to every placement-based display format: banner, native,
+  sidebar, outstream, video slider, interstitial and sticky. Popunder, push
+  and VAST are single global units/tags, not placement slots, so their caps
+  stay unit-level in their own tabs.
+
+`ad_events` impressions are attempts, not confirmed fills. Use DevTools and
+the provider dashboards for fill verification.
+
+
+S.3 Operations
+---------------
+
+Backups (bare metal, no Docker):
+
+  sudo mkdir -p /var/backups/hdpornforyou
+  sudo chmod 700 /var/backups/hdpornforyou
+  sudo crontab -e
+  # Add this as ONE line (crontab does not support backslash continuations):
+  0 3 * * * sudo -u postgres pg_dump hdpornforyou | gzip > /var/backups/hdpornforyou/db-$(date +\%F).sql.gz
+
+Keep at least 7-14 days. Test a restore on a staging database periodically.
+
+Log rotation:
+
+  sudo -u hdpornforyou -H pm2 install pm2-logrotate
+  sudo -u hdpornforyou -H pm2 set pm2-logrotate:max_size 50M
+  sudo -u hdpornforyou -H pm2 set pm2-logrotate:retain 14
+
+Create /etc/logrotate.d/caddy with this content:
+
+  /var/log/caddy/*.log {
+      weekly
+      rotate 8
+      compress
+      missingok
+      notifempty
+      copytruncate
+  }
+
+Updates:
+
+Git deployment:
+
+  sudo -u hdpornforyou -H bash -lc '
+    cd /opt/hdpornforyou &&
+    git pull &&
+    npm ci --include=dev &&
+    npm run build &&
+    CLUSTER_WORKERS=4 PG_POOL_MAX=5 PG_POOL_MIN=1 \
+      pm2 reload ecosystem.config.cjs --update-env
+  '
+
+Non-git deployment (section 0.4, method B):
+
+  # Upload the changed tree to /tmp/hdpornforyou-src on the VPS, then:
+  sudo rsync -a --exclude server/.env --exclude server/uploads/ \
+    /tmp/hdpornforyou-src/ /opt/hdpornforyou/
+  sudo chown -R hdpornforyou:hdpornforyou /opt/hdpornforyou
+  sudo -u hdpornforyou -H bash -lc '
+    cd /opt/hdpornforyou &&
+    npm ci --include=dev &&
+    npm run build &&
+    CLUSTER_WORKERS=4 PG_POOL_MAX=5 PG_POOL_MIN=1 \
+      pm2 reload ecosystem.config.cjs --update-env
+  '
+
+Never overwrite server/.env or server/uploads/ during an update.
+
+Security checklist:
+
+- PM2 and Node run as the hdpornforyou user, not root.
+- server/.env is mode 600 and owned by the app user.
+- Port 3001 and 5432 are not reachable from the internet.
+- 80/443 restricted to Cloudflare ranges; SSH allowed.
+- /setup is claimed immediately, or admin credentials are seeded.
+- Cloudflare SSL mode is Full (strict).
+- Cloudflare proxy is orange-cloud; no grey-cloud record leaks the IP.
+- Do not add a "Cache Everything" rule to /api/* or to HTML that depends on
+  visitor country. /api/geo is already `private, max-age=3600`.
+- Do not install both PostgreSQL 16 and 18.
+- Do not copy the old server/.env.
+
+
+Troubleshooting
+===============
+
+App exits immediately at boot
+  Missing PGPASSWORD (or DATABASE_URL), or the database/user does not exist.
+  PGHOST/PGPORT/PGUSER/PGDATABASE have defaults, but PGPASSWORD does not.
+  Check `pm2 logs hdpornforyou --lines 100`. The app prints which variable is
+  missing and exits with code 1.
+
+502 Bad Gateway
+  Node is not listening on 127.0.0.1:3001. Check `pm2 status` and
+  `curl http://127.0.0.1:3001/api/health`. Caddy must proxy to 3001, never 5173.
+
+526 Invalid SSL certificate
+  Cloudflare Full (strict) cannot validate Caddy's certificate. Let Caddy
+  finish HTTP-01 issuance (port 80 must reach the origin through Cloudflare),
+  or install a Cloudflare Origin Certificate and reference it with `tls`.
+
+Redirect loop / too many redirects
+  Cloudflare SSL mode is "Flexible" while Caddy redirects to HTTPS. Set
+  SSL/TLS -> Overview to Full (strict).
+
+Admin login does not persist
+  COOKIE_SECURE=1 but Express sees HTTP. Caddy terminates TLS and sets
+  X-Forwarded-Proto itself. Confirm the `tls` line is active or Let's
+  Encrypt succeeded. Confirm the Set-Cookie response contains Secure;
+  HttpOnly. Also confirm you are testing the domain over HTTPS, not the VPS
+  IP.
+
+/api/geo returns null
+  The request did not come through Cloudflare, or the header was stripped.
+  Use the proxied domain, confirm the DNS record is orange-cloud proxied,
+  and never test with http://VPS-IP:3001. Confirm the Cloudflare CIDR
+  trusted_proxies block is present.
+
+Every visitor has the same IP / rate limits hit everyone
+  Caddy is not trusting CF-Connecting-IP. Add the Cloudflare CIDR
+  trusted_proxies block from A.4. Verify client_ip in the Caddy access log
+  is the visitor address.
+
+Canonical or sitemap shows www / the VPS IP
+  Set SEO_CANONICAL_BASE in server/.env or Admin -> SEO -> canonical base.
+  Keep the www -> apex redirect in Caddy.
+
+521 / 522
+  Origin is down or unreachable. Check Caddy, Node and the firewall.
+
+Tags missing from the sitemap
+  Tags with fewer than TAG_MIN_VIDEOS (default 2) videos are noindexed and
+  omitted by design.
+
+New imported videos not in the sitemap
+  They are inserted into `videos`, caches are invalidated and cache_epoch is
+  bumped. The sitemap cache TTL is 5 minutes. If a video is still missing
+  after that, check `pm2 logs hdpornforyou-automation` and confirm the row
+  exists in the `videos` table.
+
+SSH: Load key "...": error in libcrypto: unsupported
+  The private key file is malformed, has CRLF line endings, or is missing
+  the OpenSSH PEM header/footer. Check with:
+
+    file ~/.ssh/key
+    head -n 1 ~/.ssh/key
+    ssh-keygen -y -f ~/.ssh/key
+
+  If the file starts with base64 such as `b3BlbnNzaC1rZXktdjE...`, wrap it:
+
+    {
+      echo '-----BEGIN OPENSSH PRIVATE KEY-----'
+      cat ~/.ssh/key
+      echo
+      echo '-----END OPENSSH PRIVATE KEY-----'
+    } > ~/.ssh/key.fixed
+    chmod 600 ~/.ssh/key.fixed
+    ssh-keygen -y -f ~/.ssh/key.fixed
+
+  If `file` reports CRLF:
+
+    sed -i 's/\r$//' ~/.ssh/key
+    chmod 600 ~/.ssh/key
+
+  If the file is a PuTTY .ppk, convert it with `puttygen`.
+
+SSH: Permission denied (publickey)
+  The public key is not in the target user's authorized_keys, or you are
+  using the wrong username/key. Confirm /root/.ssh/authorized_keys or
+  /home/deploy/.ssh/authorized_keys contains the matching public key. Use
+  `ssh -v -i <key> user@host` to see which key is offered.
+
+PostgreSQL 18 is on port 5433
+  You installed both PostgreSQL 16 and 18. Do not do that. Remove the 16
+  cluster or reinstall with only PostgreSQL 18, then confirm with
+  `pg_lsclusters` that 18 is on 5432.
+
+Both ExoClick and TrafficStars appear
+  The rescue hook did not detect the ExoClick sibling div. Confirm the build
+  includes src/hooks/use-ad-rescue.ts, then verify in DevTools that the
+  ExoClick render nodes are removed when TrafficStars mounts. The passback
+  should fire only after a true 5-second no-fill or script failure.
+
+ExoClick ad is clipped or the wrong format
+  The zone format does not match the placement. Native = e20, video slider =
+  e31, outstream = e37, sticky = e17, banner = e2/e10. A native zone inside
+  a 50px overflow:hidden sticky container will be clipped.
+
+ad_events impressions look wrong
+  ad_events records attempts, not confirmed fills. Do not use it as fill-rate
+  or revenue data. Use DevTools and the provider dashboards.
+
+Cloudflare returns 403 error 1000
+  Expected when a client sends its own CF-Connecting-IP header. Cloudflare
+  blocks the request. This is a security feature, not an outage.
+
+
+What NOT to do
+==============
+
+- Do not create a grey-cloud A record; it leaks the VPS IP.
+- Do not use Cloudflare SSL mode "Flexible".
+- Do not open 80/443 to 0.0.0.0/0 on the VPS.
+- Do not install or run cloudflared; this deployment uses a proxied A record.
+- Do not expose 3001 or 5432.
+- Do not run PM2 as root.
+- Do not use `pm2 start npm -- run start -i 4`.
+- Do not scale hdpornforyou-automation above one instance.
+- Do not leave both ad force controls enabled.
+- Do not leave /setup open on a live domain.
+- Do not install both PostgreSQL 16 and 18.
+- Do not restore a PostgreSQL 18 dump into PostgreSQL 16.
+- Do not copy the old server/.env.
+- Do not overwrite server/uploads/ during an update.

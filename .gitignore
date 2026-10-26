@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+server/.env
+!server/.env.example
+
+# Runtime data (uploads, database dumps, caches)
+server/uploads/
+server/data/
+data/
+.cache/
+.tmp/
+
+# Logs
+*.log
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

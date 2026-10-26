@@ -1,0 +1,104 @@
+import { useEffect, useState } from "react";
+import type { Network } from "@/lib/ad-router";
+import { isProviderFailed } from "@/lib/ad-script-state";
+
+export interface AdRescueDecision {
+  network: Network;
+  zoneId: string;
+}
+
+// One-shot console diagnostics (per page load) so operators can see WHY a
+// slot is empty: browser content blocking vs. no-fill from the provider.
+const diagSeen = new Set<string>();
+function diag(key: string, message: string) {
+  if (diagSeen.has(key)) return;
+  diagSeen.add(key);
+  console.info(`[ads] ${message}`);
+}
+
+/**
+ * Render-time cross-network rescue for ad slots.
+ *
+ * `pickAdZone` already falls back at DECISION time (preferred network has no
+ * zone configured → serve the other). This covers the remaining cases:
+ *
+ * 1. Both networks configured, preferred chosen, but its creative never
+ *    fills (empty auction / provider hiccup). After `timeoutMs` with no
+ *    creative the hook returns the fallback decision so the component
+ *    renders the other network's tag instead. This is standard publisher
+ *    passback/waterfalling: each provider's tag is used verbatim, in a
+ *    visible container, one creative per slot, and the swap only happens
+ *    when NO creative loaded — so no impressions are stacked or hidden.
+ *    (Both ExoClick and TrafficStars explicitly support passback tags.)
+ *
+ * 2. The provider's script element errored (browser content blocking such
+ *    as Firefox ETP, ad blockers, offline). That failure is observed —
+ *    never bypassed, which is prohibited by both providers' terms — and the
+ *    slot immediately passbacks to the other network when its script is
+ *    reachable, or reports `null` so the component can hide itself instead
+ *    of reserving blank space.
+ *
+ * Fill = an <iframe> anywhere in the container, or a non-empty <ins>
+ * (covers ExoClick ins creatives; TrafficStars spots inject iframes).
+ * Returns stable object references (primary/fallback as passed in).
+ */
+export function useAdRescue(
+  // readonly current: covariant — accepts RefObject<HTMLDivElement | null>.
+  ref: { readonly current: HTMLElement | null },
+  active: boolean,
+  primary: AdRescueDecision | null,
+  fallback: AdRescueDecision | null,
+  timeoutMs = 5000,
+): AdRescueDecision | null {
+  const [rescued, setRescued] = useState(false);
+  const key = primary ? `${primary.network}|${primary.zoneId}` : "";
+  const fbKey = fallback ? `${fallback.network}|${fallback.zoneId}` : "";
+  // New slot/zone: disarm so the fresh creative gets its own grace period.
+  useEffect(() => {
+    setRescued(false);
+  }, [key]);
+  useEffect(() => {
+    if (!active || !key || rescued) return;
+    const t = setTimeout(() => {
+      const el = ref.current;
+      const filled =
+        !!el &&
+        (!!el.querySelector("iframe") ||
+          [...el.querySelectorAll("ins")].some(
+            (i) =>
+              !!i.querySelector("iframe, img, object, embed") ||
+              [...i.children].some((c) => c.tagName !== "SCRIPT"),
+          ));
+      if (!filled && !isProviderFailed(primary!.network)) {
+        // The script loaded but the zone returned no creative — a provider-
+        // side matter (status/geo/device targeting). When the script itself
+        // is unavailable, the "script unavailable" diagnostic already
+        // explains the empty slot; a no-fill message here would mislead.
+        diag(
+          `nofill:${key}`,
+          fbKey
+            ? `${primary!.network} zone ${primary!.zoneId} produced no creative in ${Math.round(timeoutMs / 1000)}s — swapping to ${fbKey.replace("|", " zone ")}. If this repeats for real traffic, check the zone's status/geo/device targeting in the provider dashboard.`
+            : `${primary!.network} zone ${primary!.zoneId} produced no creative in ${Math.round(timeoutMs / 1000)}s — no passback zone configured for this placement. Check the zone's status/geo/device targeting in the provider dashboard.`,
+        );
+        if (fbKey) setRescued(true);
+      }
+    }, timeoutMs);
+    return () => clearTimeout(t);
+  }, [active, key, fbKey, rescued, timeoutMs, ref]);
+
+  if (!primary) return null;
+
+  const primaryFailed = isProviderFailed(primary.network);
+  const fallbackFailed = fallback ? isProviderFailed(fallback.network) : true;
+
+  if (primaryFailed) {
+    diag(
+      `blocked:${primary.network}`,
+      `${primary.network} provider script is unavailable — likely Firefox Enhanced Tracking Protection (Strict mode / Private window), an ad-blocker extension, or network/DNS filtering. It is the browser's protection, not a site fault; the site does not bypass it (prohibited by the providers' terms). Affected slots passback to the other network or hide.`,
+    );
+    if (fallback && !fallbackFailed) return fallback;
+    return null;
+  }
+  if (rescued && fallback && fbKey && !fallbackFailed) return fallback;
+  return primary;
+}

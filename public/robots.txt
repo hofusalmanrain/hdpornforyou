@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /teamspace
+Disallow: /account
+Disallow: /setup
+Disallow: /api/
+Sitemap: https://hdpornforyou.com/sitemap.xml

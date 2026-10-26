@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0f0f0f" />
+    <meta name="rating" content="adult" />
+    <meta name="RTA-Label" content="RTA-5042-1996-1400-1577-RTA" />
+    <link rel="icon" href="/favicon.ico" sizes="48x48" id="app-favicon" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" id="app-favicon-svg" />
+    <link rel="icon" type="image/png" sizes="96x96" href="/favicon-96x96.png" id="app-favicon-96" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <title>HDPORNFORYOU — Premium 18+ Embedded Video Streaming Platform</title>
+    <meta
+      name="description"
+      content="Watch free 18+ adult videos on HDPORNFORYOU. All content is embedded via Eporner's official API — we do not host or store any video files. All models are 18+."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="HDPORNFORYOU — Premium 18+ Embedded Video Streaming Platform" />
+    <meta
+      property="og:description"
+      content="Free 18+ adult video platform. All videos are embedded from Eporner via official API. We do not host any content. All models are 18+."
+    />
+    <meta property="og:site_name" content="HDPORNFORYOU" />
+    <meta property="og:url" content="https://hdpornforyou.com/" />
+    <link rel="canonical" href="https://hdpornforyou.com/" />
+    <link rel="alternate" hreflang="en" href="https://hdpornforyou.com/" />
+    <link rel="alternate" hreflang="x-default" href="https://hdpornforyou.com/" />
+    <meta property="og:image" content="https://hdpornforyou.com/og-image.jpg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:alt" content="HDPORNFORYOU — 18+ Embedded Adult Streaming" />
+    <meta property="og:locale" content="en_US" />
+    <meta name="robots" content="index, follow" />
+    <meta name="author" content="HDPORNFORYOU" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:site" content="@hdpornforyou" />
+    <meta name="twitter:creator" content="@hdpornforyou" />
+    <meta name="twitter:title" content="HDPORNFORYOU — Premium 18+ Embedded Video Streaming Platform" />
+    <meta
+      name="twitter:description"
+      content="Free 18+ adult video platform. 100% embedded streaming via Eporner — no hosting. All models are 18+."
+    />
+    <meta name="twitter:image" content="https://hdpornforyou.com/og-image.jpg" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "Organization",
+        "name": "HDPORNFORYOU",
+        "url": "https://hdpornforyou.com/",
+        "logo": "https://hdpornforyou.com/web-app-manifest-512x512.png"
+      }
+    </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": "HDPORNFORYOU",
+        "url": "https://hdpornforyou.com/",
+        "potentialAction": {
+          "@type": "SearchAction",
+          "target": "https://hdpornforyou.com/search?q={search_term_string}",
+          "query-input": "required name=search_term_string"
+        }
+      }
+    </script>
+    <link rel="preload" href="/fonts/inter.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="dns-prefetch" href="https://www.eporner.com" />
+    <link rel="preconnect" href="https://www.eporner.com" crossorigin="anonymous" />
+    <link rel="dns-prefetch" href="https://a.magsrv.com" />
+    <link rel="preconnect" href="https://a.magsrv.com" crossorigin="anonymous" />
+    <link rel="dns-prefetch" href="https://cdn.tsyndicate.com" />
+    <script>
+      // Apply the saved/system theme before first paint to avoid a flash.
+      (function () {
+        try {
+          var m = localStorage.getItem("hdpornforyou:theme-mode");
+          var light =
+            m === "light" ||
+            (m !== "dark" && window.matchMedia("(prefers-color-scheme: light)").matches);
+          if (light) document.documentElement.classList.add("light");
+        } catch (e) {}
+      })();
+    </script>
+    <script>
+      // Fast-path: hydrate favicon & brand logo instantly from localStorage
+      // (populated by previous visit), then refresh from API in the background.
+      // This eliminates the "logo pops in a second later" flash.
+      (function () {
+        try {
+          var cachedFav = localStorage.getItem("hdpornforyou:favicon-url");
+          if (cachedFav) {
+            var link = document.getElementById("app-favicon");
+            if (link) link.href = cachedFav;
+          }
+          var cachedLogo = localStorage.getItem("hdpornforyou:brand-logo-url");
+          if (cachedLogo) {
+            window.__BRAND_LOGO_URL__ = cachedLogo;
+          }
+        } catch (e) {}
+
+        function refresh(url, key, apply) {
+          fetch(url, { cache: "force-cache" })
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+              var v = d && d.url ? d.url : null;
+              try {
+                if (v) localStorage.setItem(key, v);
+                else localStorage.removeItem(key);
+              } catch (e) {}
+              apply(v);
+            })
+            .catch(function () {});
+        }
+
+        refresh("/api/favicon", "hdpornforyou:favicon-url", function (v) {
+          if (!v) return;
+          var link = document.getElementById("app-favicon") || document.createElement("link");
+          if (!link.parentNode) { link.rel = "icon"; link.id = "app-favicon"; document.head.appendChild(link); }
+          link.href = v;
+          var svg = document.getElementById("app-favicon-svg");
+          var png = document.getElementById("app-favicon-96");
+          if (svg) svg.remove();
+          if (png) png.remove();
+        });
+        refresh("/api/brand-logo", "hdpornforyou:brand-logo-url", function (v) {
+          window.__BRAND_LOGO_URL__ = v || undefined;
+          window.dispatchEvent(new Event("hdpornforyou:brand-logo-changed"));
+        });
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

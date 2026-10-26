@@ -1,0 +1,118 @@
+# Production-grade self-hosted stack:
+#  - postgres : tuned PostgreSQL with persistent volume
+#  - app      : Node/Express server (clustered via PM2 inside the container
+#               by setting CLUSTER_WORKERS, or scale with `docker compose
+#               up --scale app=N` behind a reverse proxy).
+#  - automation : ONE dedicated process owning the entire automation engine
+#               (import timers, AI budget, thumbnail scans). Admin Start/Stop
+#               clicks are relayed to it through the automation_commands
+#               table; the Postgres advisory lock stays as a fail-safe.
+#
+# All data is local. No external services.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: hdpornforyou-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       "${PGDATABASE:-hdpornforyou}"
+      POSTGRES_USER:     "${PGUSER:-hdpornforyou}"
+      POSTGRES_PASSWORD: "${PGPASSWORD:?set PGPASSWORD in .env}"
+    # Bind to localhost only — keep the DB off the public internet.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - hdpornforyou-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Conservative tuning for a 4 GB VPS. Raise these alongside VPS upgrades:
+    #   shared_buffers      = 25% of RAM
+    #   effective_cache_size = 50–75% of RAM
+    #   work_mem            = 4–16 MB
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "shared_buffers=512MB"
+      - "-c"
+      - "effective_cache_size=1536MB"
+      - "-c"
+      - "work_mem=8MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "wal_compression=on"
+
+  app:
+    build: .
+    image: hdpornforyou:latest
+    container_name: hdpornforyou
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3001:3001"
+    volumes:
+      - hdpornforyou-uploads:/app/uploads
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      STATIC_DIR: /srv/public
+      # Pure API worker: the automation engine runs in the "automation"
+      # service below.
+      RUN_AUTOMATION: "0"
+      SESSION_SECRET: "${SESSION_SECRET:?set SESSION_SECRET in .env (use: openssl rand -hex 32)}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-1}"
+      # Postgres connection
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: "${PGUSER:-hdpornforyou}"
+      PGPASSWORD: "${PGPASSWORD}"
+      PGDATABASE: "${PGDATABASE:-hdpornforyou}"
+      # Tunables (safe defaults — see DEPLOY.md)
+      PG_POOL_MAX: "${PG_POOL_MAX:-20}"
+      PG_STATEMENT_TIMEOUT_MS: "${PG_STATEMENT_TIMEOUT_MS:-5000}"
+      CACHE_MAX_KEYS: "${CACHE_MAX_KEYS:-5000}"
+      BATCH_FLUSH_MS: "${BATCH_FLUSH_MS:-30000}"
+      # Optional admin bootstrap (skips setup wizard):
+      # ADMIN_USERNAME: "${ADMIN_USERNAME}"
+      # ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+
+  automation:
+    # Dedicated automation engine — owns EVERY import timer/cycle, the AI
+    # budget check, and thumbnail scans. PM2/Docker restarts it on crash and
+    # the engine watchdog re-arms the schedule from DB state, so 24/7 import
+    # resumes automatically. Exactly one instance — never scale this service.
+    build: .
+    image: hdpornforyou:latest
+    container_name: hdpornforyou-automation
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      RUN_AUTOMATION: "1"
+      # Postgres connection
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: "${PGUSER:-hdpornforyou}"
+      PGPASSWORD: "${PGPASSWORD}"
+      PGDATABASE: "${PGDATABASE:-hdpornforyou}"
+      # Tunables (safe defaults — see DEPLOY.md)
+      PG_POOL_MAX: "${PG_POOL_MAX:-20}"
+      PG_STATEMENT_TIMEOUT_MS: "${PG_STATEMENT_TIMEOUT_MS:-5000}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+    command: ["node", "src/automation-worker.js"]
+
+volumes:
+  hdpornforyou-pgdata:
+  hdpornforyou-uploads:
